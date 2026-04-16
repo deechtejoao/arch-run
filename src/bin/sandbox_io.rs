@@ -109,12 +109,25 @@ async fn run_io_loop_linux(
                         let std_file = cap_file.into_std();
                         let uring_file = tokio_uring::fs::File::from_std(std_file);
 
-                        let buf = vec![0u8; 8192];
-                        let (res, mut buf) = uring_file.read_at(buf, 0).await;
-                        if let Ok(n) = res {
-                            buf.truncate(n);
-                            let _ = driver.on_read_complete(&path, Bytes::from(buf)).await;
+                        let mut full_buf = Vec::new();
+                        let mut offset = 0;
+                        loop {
+                            let buf = vec![0u8; 8192];
+                            let (res, mut buf) = uring_file.read_at(buf, offset).await;
+                            match res {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buf.truncate(n);
+                                    full_buf.extend_from_slice(&buf);
+                                    offset += n as u64;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Read error: {}", e);
+                                    break;
+                                }
+                            }
                         }
+                        let _ = driver.on_read_complete(&path, Bytes::from(full_buf)).await;
                     } else {
                         tracing::error!("Sandbox isolation blocked read access to {:?}", path);
                     }
@@ -125,9 +138,16 @@ async fn run_io_loop_linux(
                         let std_file = cap_file.into_std();
                         let uring_file = tokio_uring::fs::File::from_std(std_file);
 
+                        let len = data.len();
                         let (res, _) = uring_file.write_at(data, 0).await;
-                        if let Ok(n) = res {
-                            let _ = driver.on_write_complete(&path, n).await;
+                        match res {
+                            Ok(n) => {
+                                if n < len {
+                                    tracing::warn!("Short write: {}/{} bytes", n, len);
+                                }
+                                let _ = driver.on_write_complete(&path, n).await;
+                            }
+                            Err(e) => tracing::error!("Write error: {}", e),
                         }
                     } else {
                         tracing::error!("Sandbox isolation blocked write access to {:?}", path);
