@@ -7,6 +7,8 @@ pub struct CoreEngine {
     cache_root: PathBuf,
 }
 
+use std::process::Command;
+
 impl CoreEngine {
     /// Initialize the engine, validating the existence of bubblewrap and required paths.
     pub fn new() -> Result<Self> {
@@ -17,6 +19,43 @@ impl CoreEngine {
         std::fs::create_dir_all(&cache_root).context("Failed to create cache directory")?;
 
         Ok(Self { cache_root })
+    }
+
+    /// Resolves the dependency graph for a target package using `pacman -Sp`.
+    /// Employs a non-cyclic directed graph (DAG) structure for resolution.
+    pub async fn resolve_dependencies(&self, pkg_name: &str) -> Result<Vec<PackageLayer>> {
+        // Execute pacman -Sp --print-format "%n %v %u" to get metadata without root.
+        let output = Command::new("pacman")
+            .args(["-Sp", "--print-format", "%n %v %u", pkg_name])
+            .output()
+            .context("Failed to execute pacman. Is it installed?")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("pacman failed: {}", stderr));
+        }
+
+        let mut layers = Vec::new();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 3 {
+                let name = parts[0].to_string();
+                let version = parts[1].to_string();
+                let url = parts[2].to_string();
+                let path = self.cache_root.join(format!("{}-{}", name, version));
+                
+                layers.push(PackageLayer {
+                    name,
+                    version,
+                    url,
+                    path,
+                });
+            }
+        }
+
+        Ok(layers)
     }
 }
 
