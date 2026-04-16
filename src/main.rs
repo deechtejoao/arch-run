@@ -117,21 +117,54 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// Builds a unified symlink farm (merged view) of all package layers.
+    /// This prevents overlapping bind mount issues in bubblewrap and optimizes lookup performance.
+    fn build_symlink_farm(&self, layers: &[PackageLayer]) -> Result<tempfile::TempDir> {
+        let farm_dir = tempfile::tempdir_in(&self.cache_root)?;
+        
+        for layer in layers {
+            let usr_path = layer.path.join("usr");
+            if !usr_path.exists() {
+                continue;
+            }
+            
+            for entry in walkdir::WalkDir::new(&usr_path) {
+                let entry = entry?;
+                if let Ok(rel_path) = entry.path().strip_prefix(&usr_path) {
+                    if rel_path.as_os_str().is_empty() {
+                        continue;
+                    }
+                    
+                    let target_path = farm_dir.path().join("usr").join(rel_path);
+                    
+                    if entry.file_type().is_dir() {
+                        std::fs::create_dir_all(&target_path)?;
+                    } else if !target_path.exists() {
+                        std::os::unix::fs::symlink(entry.path(), &target_path)?;
+                    }
+                }
+            }
+        }
+        
+        Ok(farm_dir)
+    }
+
     /// Spawns the bubblewrap container.
     /// Construct bwrap command-line arguments and execv.
     pub fn execute_sandbox(&self, entry_point: &str, layers: &[PackageLayer], args: &[String]) -> Result<()> {
+        tracing::info!("Building unified symlink farm for layers...");
+        let farm = self.build_symlink_farm(layers)?;
+        
         let mut bwrap = Command::new("bwrap");
         
         // Basic mounts for a functional rootfs
         bwrap.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--shm", "/dev/shm"]);
         bwrap.args(["--unshare-all", "--share-net", "--die-with-parent"]);
 
-        // Bind all layers into the sandbox
-        for layer in layers {
-            let usr_path = layer.path.join("usr");
-            if usr_path.exists() {
-                bwrap.args(["--ro-bind", &usr_path.to_string_lossy(), "/usr"]);
-            }
+        // Bind the merged symlink farm into the sandbox
+        let merged_usr = farm.path().join("usr");
+        if merged_usr.exists() {
+            bwrap.args(["--ro-bind", &merged_usr.to_string_lossy(), "/usr"]);
         }
 
         // Add common lib paths if they aren't already in /usr
