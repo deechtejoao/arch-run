@@ -174,6 +174,12 @@ impl CoreEngine {
         bwrap.args(["--dir", "/tmp/arch-run"]);
         bwrap.args(["--ro-bind", &farm_path, "/tmp/arch-run"]);
 
+        // Allow read-write access to current working directory
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_str = cwd.to_string_lossy().to_string();
+            bwrap.args(["--bind", &cwd_str, &cwd_str]);
+        }
+
         // Inject the package's bin and lib paths into the environment
         bwrap.arg("--setenv").arg("PATH").arg("/tmp/arch-run/usr/bin:/usr/local/bin:/usr/bin:/bin");
         bwrap.arg("--setenv").arg("LD_LIBRARY_PATH").arg("/tmp/arch-run/usr/lib:/tmp/arch-run/usr/lib64");
