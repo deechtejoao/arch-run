@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use futures_util::StreamExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tokio::io::AsyncWriteExt;
 
 /// The main orchestration engine for the ephemeral sandbox.
 pub struct CoreEngine {
     cache_root: PathBuf,
 }
-
-use std::process::Command;
 
 impl CoreEngine {
     /// Initialize the engine, validating the existence of bubblewrap and required paths.
@@ -56,6 +57,54 @@ impl CoreEngine {
         }
 
         Ok(layers)
+    }
+
+    /// Fetches missing package layers from mirrors and extracts them.
+    /// Optimized with tokio for concurrent I/O throughput.
+    pub async fn fetch_layers(&self, layers: &[PackageLayer]) -> Result<()> {
+        let client = reqwest::Client::new();
+
+        for layer in layers {
+            if layer.path.exists() {
+                continue;
+            }
+
+            let response = client.get(&layer.url).send().await?;
+            if !response.status().is_success() {
+                return Err(anyhow::anyhow!("Failed to download {}: {}", layer.name, response.status()));
+            }
+
+            let mut stream = response.bytes_stream();
+            let tmp_file = tempfile::NamedTempFile::new_in(&self.cache_root)?;
+            
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(tmp_file.path())
+                .await?;
+
+            while let Some(item) = stream.next().await {
+                let chunk = item.context("Error while downloading")?;
+                file.write_all(&chunk).await?;
+            }
+
+            // Extract the layer
+            self.extract_layer(&layer, tmp_file.path())?;
+        }
+
+        Ok(())
+    }
+
+    /// Extract a .pkg.tar.zst archive into the cache directory.
+    fn extract_layer(&self, layer: &PackageLayer, archive: &Path) -> Result<()> {
+        std::fs::create_dir_all(&layer.path)?;
+        
+        let file = std::fs::File::open(archive)?;
+        let decoder = zstd::stream::read::Decoder::new(file)?;
+        let mut archive = tar::Archive::new(decoder);
+        
+        archive.unpack(&layer.path).context("Failed to unpack archive")?;
+        
+        Ok(())
     }
 }
 
