@@ -63,47 +63,57 @@ impl CoreEngine {
     /// Optimized with tokio for concurrent I/O throughput.
     pub async fn fetch_layers(&self, layers: &[PackageLayer]) -> Result<()> {
         let client = reqwest::Client::new();
+        let mut tasks = Vec::new();
 
         for layer in layers {
             if layer.path.exists() {
                 continue;
             }
 
-            let response = client.get(&layer.url).send().await?;
-            if !response.status().is_success() {
-                return Err(anyhow::anyhow!("Failed to download {}: {}", layer.name, response.status()));
-            }
+            let client = client.clone();
+            let layer = layer.clone();
+            let cache_root = self.cache_root.clone();
 
-            let mut stream = response.bytes_stream();
-            let tmp_file = tempfile::NamedTempFile::new_in(&self.cache_root)?;
-            
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(tmp_file.path())
-                .await?;
+            tasks.push(tokio::spawn(async move {
+                tracing::info!("Fetching layer: {} ({})", layer.name, layer.version);
+                let response = client.get(&layer.url).send().await?;
+                if !response.status().is_success() {
+                    return Err(anyhow::anyhow!("Failed to download {}: {}", layer.name, response.status()));
+                }
 
-            while let Some(item) = stream.next().await {
-                let chunk = item.context("Error while downloading")?;
-                file.write_all(&chunk).await?;
-            }
+                let mut stream = response.bytes_stream();
+                let tmp_path = cache_root.join(format!("{}-{}.part", layer.name, layer.version));
+                
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp_path)
+                    .await?;
 
-            // Extract the layer
-            self.extract_layer(&layer, tmp_file.path())?;
+                while let Some(item) = stream.next().await {
+                    let chunk = item.context("Error while downloading")?;
+                    file.write_all(&chunk).await?;
+                }
+
+                tokio::task::spawn_blocking(move || {
+                    std::fs::create_dir_all(&layer.path)?;
+                    let file = std::fs::File::open(&tmp_path)?;
+                    let decoder = zstd::stream::read::Decoder::new(file)?;
+                    let mut archive = tar::Archive::new(decoder);
+                    archive.unpack(&layer.path).context("Failed to unpack archive")?;
+                    std::fs::remove_file(&tmp_path)?;
+                    Ok::<(), anyhow::Error>(())
+                }).await??;
+
+                Ok::<(), anyhow::Error>(())
+            }));
         }
 
-        Ok(())
-    }
+        for task in tasks {
+            task.await??;
+        }
 
-    /// Extract a .pkg.tar.zst archive into the cache directory.
-    fn extract_layer(&self, layer: &PackageLayer, archive: &Path) -> Result<()> {
-        std::fs::create_dir_all(&layer.path)?;
-        
-        let file = std::fs::File::open(archive)?;
-        let decoder = zstd::stream::read::Decoder::new(file)?;
-        let mut archive = tar::Archive::new(decoder);
-        
-        archive.unpack(&layer.path).context("Failed to unpack archive")?;
-        
         Ok(())
     }
 
