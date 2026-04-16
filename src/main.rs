@@ -7,7 +7,7 @@ use tokio::io::AsyncWriteExt;
 
 /// The main orchestration engine for the ephemeral sandbox.
 pub struct CoreEngine {
-    cache_root: PathBuf,
+    pub cache_root: PathBuf,
 }
 
 impl CoreEngine {
@@ -221,11 +221,36 @@ async fn main() -> Result<()> {
     match args.command {
         Some(Commands::Prune { all }) => {
             tracing::warn!("Pruning cache (all: {})", all);
-            // Implementation of cache pruning
+            if engine.cache_root.exists() {
+                if all {
+                    std::fs::remove_dir_all(&engine.cache_root)?;
+                    std::fs::create_dir_all(&engine.cache_root)?;
+                    println!("Cache completely pruned.");
+                } else {
+                    println!("Partial pruning not implemented. Use --all to clear completely.");
+                }
+            } else {
+                println!("Cache does not exist.");
+            }
         }
         Some(Commands::List) => {
-            tracing::info!("Listing cached layers");
-            // Implementation of cache listing
+            println!("Cached Layers in {}:", engine.cache_root.display());
+            if engine.cache_root.exists() {
+                let mut count = 0;
+                for entry in std::fs::read_dir(&engine.cache_root)? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if entry.file_type()?.is_dir() && !name.starts_with(".tmp") {
+                        println!("  - {}", name);
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    println!("  (Cache is empty)");
+                }
+            } else {
+                println!("  (Cache directory not found)");
+            }
         }
         None => {
             if let Some(pkg) = args.package {
