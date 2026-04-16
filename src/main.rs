@@ -168,6 +168,34 @@ enum Commands {
     List,
 }
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
+    let engine = CoreEngine::new()?;
+
+    match args.command {
+        Some(Commands::Prune { all }) => {
+            tracing::warn!("Pruning cache (all: {})", all);
+            // Implementation of cache pruning
+        }
+        Some(Commands::List) => {
+            tracing::info!("Listing cached layers");
+            // Implementation of cache listing
+        }
+        None => {
+            if let Some(pkg) = args.package {
+                let layers = engine.resolve_dependencies(&pkg).await?;
+                engine.fetch_layers(&layers).await?;
+                engine.execute_sandbox(&pkg, &layers, &args.args)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Represents a versioned Arch Linux package layer.
 /// Aligned for cache-efficiency and fast lookup.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
