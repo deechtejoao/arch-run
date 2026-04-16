@@ -106,6 +106,38 @@ impl CoreEngine {
         
         Ok(())
     }
+
+    /// Spawns the bubblewrap container.
+    /// Construct bwrap command-line arguments and execv.
+    pub fn execute_sandbox(&self, entry_point: &str, layers: &[PackageLayer], args: &[String]) -> Result<()> {
+        let mut bwrap = Command::new("bwrap");
+        
+        // Basic mounts for a functional rootfs
+        bwrap.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--shm", "/dev/shm"]);
+        bwrap.args(["--unshare-all", "--share-net", "--die-with-parent"]);
+
+        // Bind all layers into the sandbox
+        for layer in layers {
+            let usr_path = layer.path.join("usr");
+            if usr_path.exists() {
+                bwrap.args(["--ro-bind", &usr_path.to_string_lossy(), "/usr"]);
+            }
+        }
+
+        // Add common lib paths if they aren't already in /usr
+        bwrap.args(["--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64", "--symlink", "usr/bin", "/bin"]);
+
+        // Execute the target
+        bwrap.arg(entry_point);
+        bwrap.args(args);
+
+        let status = bwrap.status().context("Failed to execute bwrap")?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("Sandbox execution failed"));
+        }
+
+        Ok(())
+    }
 }
 
 /// Command-line arguments for the arch-run executor.
