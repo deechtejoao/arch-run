@@ -25,9 +25,9 @@ impl CoreEngine {
     /// Resolves the dependency graph for a target package using `pacman -Sp`.
     /// Employs a non-cyclic directed graph (DAG) structure for resolution.
     pub async fn resolve_dependencies(&self, pkg_name: &str) -> Result<Vec<PackageLayer>> {
-        // Execute pacman -Sp --print-format "%n %v %u" to get metadata without root.
+        // Execute pacman -Sp --print-format "%n %v %l" to get metadata without root.
         let output = Command::new("pacman")
-            .args(["-Sp", "--print-format", "%n %v %u", pkg_name])
+            .args(["-Sp", "--print-format", "%n %v %l", pkg_name])
             .output()
             .context("Failed to execute pacman. Is it installed?")?;
 
@@ -95,6 +95,10 @@ impl CoreEngine {
                     let chunk = item.context("Error while downloading")?;
                     file.write_all(&chunk).await?;
                 }
+                
+                // Flush and close the file before spawning the blocking task to unpack it
+                file.flush().await?;
+                drop(file);
 
                 tokio::task::spawn_blocking(move || {
                     std::fs::create_dir_all(&layer.path)?;
@@ -157,18 +161,22 @@ impl CoreEngine {
         
         let mut bwrap = Command::new("bwrap");
         
-        // Basic mounts for a functional rootfs
-        bwrap.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--shm", "/dev/shm"]);
         bwrap.args(["--unshare-all", "--share-net", "--die-with-parent"]);
 
-        // Bind the merged symlink farm into the sandbox
-        let merged_usr = farm.path().join("usr");
-        if merged_usr.exists() {
-            bwrap.args(["--ro-bind", &merged_usr.to_string_lossy(), "/usr"]);
-        }
+        // Mount the host filesystem read-only to provide glibc and other system libraries
+        bwrap.args(["--ro-bind", "/", "/"]);
 
-        // Add common lib paths if they aren't already in /usr
-        bwrap.args(["--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64", "--symlink", "usr/bin", "/bin"]);
+        // Basic mounts for a functional rootfs (must be after / to overlay it)
+        bwrap.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/dev/shm"]);
+
+        // Bind the merged symlink farm into the sandbox at /tmp/arch-run
+        let farm_path = farm.path().to_string_lossy().to_string();
+        bwrap.args(["--dir", "/tmp/arch-run"]);
+        bwrap.args(["--ro-bind", &farm_path, "/tmp/arch-run"]);
+
+        // Inject the package's bin and lib paths into the environment
+        bwrap.arg("--setenv").arg("PATH").arg("/tmp/arch-run/usr/bin:/usr/local/bin:/usr/bin:/bin");
+        bwrap.arg("--setenv").arg("LD_LIBRARY_PATH").arg("/tmp/arch-run/usr/lib:/tmp/arch-run/usr/lib64");
 
         // Execute the target
         bwrap.arg(entry_point);
@@ -191,7 +199,6 @@ struct Args {
     command: Option<Commands>,
 
     /// The name of the package to execute.
-    #[arg(required_unless_present = "command")]
     package: Option<String>,
 
     /// Arguments to pass to the executed package.
