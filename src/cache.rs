@@ -36,15 +36,15 @@ impl CacheManager {
 
     /// Resolves the priority chain and returns a fully provisioned, absolute cache directory path.
     pub fn init(&self) -> Result<PathBuf> {
-        let dir = self.resolve_dir()?;
-        let expanded = Self::expand_tilde(&dir)?;
+        let dir = self.resolve_dir().context("Failed to resolve cache directory")?;
+        let expanded = Self::expand_tilde(&dir).with_context(|| format!("Failed to expand tilde in path: {:?}", dir))?;
 
         if !expanded.exists() {
             fs::create_dir_all(&expanded)
                 .with_context(|| format!("Failed to recursively create cache directory at {:?}", expanded))?;
         }
 
-        Ok(expanded.canonicalize().unwrap_or(expanded))
+        Ok(expanded.canonicalize().with_context(|| format!("Failed to canonicalize cache path: {:?}", expanded)).unwrap_or(expanded))
     }
 
     /// Resolves the cache directory according to strict priority logic (highest to lowest):
@@ -67,10 +67,10 @@ impl CacheManager {
         if let Some(ref path) = self.config_path {
             if path.exists() {
                 let content = fs::read_to_string(path)
-                    .with_context(|| format!("Failed to read config file at {:?}", path))?;
+                    .with_context(|| format!("Failed to read configuration file at {:?}", path))?;
                     
                 let config: CacheConfig = toml::from_str(&content)
-                    .with_context(|| "Failed to parse TOML configuration")?;
+                    .with_context(|| format!("Failed to parse TOML configuration from {:?}", path))?;
                     
                 if let Some(dir) = config.cache.dir {
                     return Ok(PathBuf::from(dir));
@@ -83,7 +83,11 @@ impl CacheManager {
             return Ok(proj_dirs.cache_dir().to_path_buf());
         }
 
-        anyhow::bail!("Could not resolve a default system cache directory. Ensure adequate environment permissions.")
+        anyhow::bail!(
+            "Could not resolve a default system cache directory for app '{}'. \
+             Please provide a directory via CLI, 'APP_CACHE_DIR' env var, or ensure system XDG paths are set.",
+            self.app_name
+        )
     }
 
     /// Expands `~` if present at the start of a path string safely.

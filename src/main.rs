@@ -14,10 +14,11 @@ impl CoreEngine {
     /// Initialize the engine, validating the existence of bubblewrap and required paths.
     pub fn new() -> Result<Self> {
         let project_dirs = directories::ProjectDirs::from("org", "arch-run", "arch-run")
-            .ok_or_else(|| anyhow::anyhow!("Could not determine cache directory"))?;
+            .ok_or_else(|| anyhow::anyhow!("Could not determine standard project directories for arch-run"))?;
         
         let cache_root = project_dirs.cache_dir().to_path_buf();
-        std::fs::create_dir_all(&cache_root).context("Failed to create cache directory")?;
+        std::fs::create_dir_all(&cache_root)
+            .with_context(|| format!("Failed to ensure cache directory exists at {:?}", cache_root))?;
 
         Ok(Self { cache_root })
     }
@@ -29,11 +30,11 @@ impl CoreEngine {
         let output = Command::new("pacman")
             .args(["-Sp", "--print-format", "%n %v %l", pkg_name])
             .output()
-            .context("Failed to execute pacman. Is it installed?")?;
+            .with_context(|| format!("Failed to execute 'pacman' for package '{}'. Is pacman installed and accessible?", pkg_name))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("pacman failed: {}", stderr));
+            return Err(anyhow::anyhow!("pacman resolution failed for '{}': {}", pkg_name, stderr.trim()));
         }
 
         let mut layers = Vec::new();
@@ -76,9 +77,11 @@ impl CoreEngine {
 
             tasks.push(tokio::spawn(async move {
                 tracing::info!("Fetching layer: {} ({})", layer.name, layer.version);
-                let response = client.get(&layer.url).send().await?;
+                let response = client.get(&layer.url).send().await
+                    .with_context(|| format!("Failed to initiate download for {} from {}", layer.name, layer.url))?;
+                
                 if !response.status().is_success() {
-                    return Err(anyhow::anyhow!("Failed to download {}: {}", layer.name, response.status()));
+                    return Err(anyhow::anyhow!("Failed to download {} (status {}): {}", layer.name, response.status(), layer.url));
                 }
 
                 let mut stream = response.bytes_stream();
@@ -101,14 +104,23 @@ impl CoreEngine {
                 drop(file);
 
                 tokio::task::spawn_blocking(move || {
-                    std::fs::create_dir_all(&layer.path)?;
-                    let file = std::fs::File::open(&tmp_path)?;
-                    let decoder = zstd::stream::read::Decoder::new(file)?;
+                    std::fs::create_dir_all(&layer.path)
+                        .with_context(|| format!("Failed to create layer directory at {:?}", layer.path))?;
+                    
+                    let file = std::fs::File::open(&tmp_path)
+                        .with_context(|| format!("Failed to open temporary file {:?}", tmp_path))?;
+                        
+                    let decoder = zstd::stream::read::Decoder::new(file)
+                        .with_context(|| "Failed to initialize zstd decoder for package")?;
+                        
                     let mut archive = tar::Archive::new(decoder);
-                    archive.unpack(&layer.path).context("Failed to unpack archive")?;
-                    std::fs::remove_file(&tmp_path)?;
+                    archive.unpack(&layer.path)
+                        .with_context(|| format!("Failed to unpack package {} into {:?}", layer.name, layer.path))?;
+                        
+                    std::fs::remove_file(&tmp_path)
+                        .with_context(|| format!("Failed to cleanup temporary file {:?}", tmp_path))?;
                     Ok::<(), anyhow::Error>(())
-                }).await??;
+                }).await.context("Layer extraction task panicked")??;
 
                 Ok::<(), anyhow::Error>(())
             }));
@@ -142,9 +154,11 @@ impl CoreEngine {
                     let target_path = farm_dir.path().join("usr").join(rel_path);
                     
                     if entry.file_type().is_dir() {
-                        std::fs::create_dir_all(&target_path)?;
+                        std::fs::create_dir_all(&target_path)
+                            .with_context(|| format!("Failed to create directory in symlink farm: {:?}", target_path))?;
                     } else if !target_path.exists() {
-                        std::os::unix::fs::symlink(entry.path(), &target_path)?;
+                        std::os::unix::fs::symlink(entry.path(), &target_path)
+                            .with_context(|| format!("Failed to create symlink: {:?} -> {:?}", target_path, entry.path()))?;
                     }
                 }
             }
@@ -188,9 +202,9 @@ impl CoreEngine {
         bwrap.arg(entry_point);
         bwrap.args(args);
 
-        let status = bwrap.status().context("Failed to execute bwrap")?;
+        let status = bwrap.status().with_context(|| format!("Failed to execute bwrap for entry point '{}'", entry_point))?;
         if !status.success() {
-            return Err(anyhow::anyhow!("Sandbox execution failed"));
+            return Err(anyhow::anyhow!("Sandbox execution failed for '{}' with exit status {}", entry_point, status));
         }
 
         Ok(())
@@ -199,7 +213,7 @@ impl CoreEngine {
 
 /// Command-line arguments for the arch-run executor.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, arg_required_else_help = true)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -236,24 +250,28 @@ async fn main() -> Result<()> {
             tracing::warn!("Pruning cache (all: {})", all);
             if engine.cache_root.exists() {
                 if all {
-                    std::fs::remove_dir_all(&engine.cache_root)?;
-                    std::fs::create_dir_all(&engine.cache_root)?;
+                    std::fs::remove_dir_all(&engine.cache_root)
+                        .with_context(|| format!("Failed to remove cache directory at {:?}", engine.cache_root))?;
+                    std::fs::create_dir_all(&engine.cache_root)
+                        .with_context(|| format!("Failed to recreate empty cache directory at {:?}", engine.cache_root))?;
                     println!("Cache completely pruned.");
                 } else {
                     println!("Partial pruning not implemented. Use --all to clear completely.");
                 }
             } else {
-                println!("Cache does not exist.");
+                println!("Cache does not exist at {:?}.", engine.cache_root);
             }
         }
         Some(Commands::List) => {
             println!("Cached Layers in {}:", engine.cache_root.display());
             if engine.cache_root.exists() {
                 let mut count = 0;
-                for entry in std::fs::read_dir(&engine.cache_root)? {
-                    let entry = entry?;
+                for entry in std::fs::read_dir(&engine.cache_root)
+                    .with_context(|| format!("Failed to read cache directory at {:?}", engine.cache_root))? {
+                    let entry = entry.context("Failed to read cache directory entry")?;
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if entry.file_type()?.is_dir() && !name.starts_with(".tmp") {
+                    let file_type = entry.file_type().context("Failed to get file type for cache entry")?;
+                    if file_type.is_dir() && !name.starts_with(".tmp") {
                         println!("  - {}", name);
                         count += 1;
                     }
@@ -262,14 +280,17 @@ async fn main() -> Result<()> {
                     println!("  (Cache is empty)");
                 }
             } else {
-                println!("  (Cache directory not found)");
+                println!("  (Cache directory not found at {:?})", engine.cache_root);
             }
         }
         None => {
             if let Some(pkg) = args.package {
-                let layers = engine.resolve_dependencies(&pkg).await?;
-                engine.fetch_layers(&layers).await?;
-                engine.execute_sandbox(&pkg, &layers, &args.args)?;
+                let layers = engine.resolve_dependencies(&pkg).await
+                    .with_context(|| format!("Failed to resolve dependencies for package '{}'", pkg))?;
+                engine.fetch_layers(&layers).await
+                    .with_context(|| format!("Failed to fetch layers for package '{}'", pkg))?;
+                engine.execute_sandbox(&pkg, &layers, &args.args)
+                    .with_context(|| format!("Failed to execute sandbox for package '{}'", pkg))?;
             }
         }
     }
