@@ -224,6 +224,10 @@ struct Args {
     /// Arguments to pass to the executed package.
     #[arg(last = true)]
     args: Vec<String>,
+
+    /// Increase logging verbosity (can be used multiple times).
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 #[derive(Subcommand, Debug)]
@@ -240,8 +244,22 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
     let args = Args::parse();
+
+    let level_filter = match args.verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level_filter));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(args.verbose > 1) // Only show targets (modules) in debug/trace
+        .init();
 
     let engine = CoreEngine::new()?;
 
