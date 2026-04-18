@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
 use tokio::io::AsyncWriteExt;
@@ -162,9 +163,52 @@ impl CoreEngine {
                         std::fs::create_dir_all(&farm_entry)
                             .with_context(|| format!("Failed to create directory in symlink farm: {:?}", farm_entry))?;
                     } else if !farm_entry.exists() {
-                        // Point symlinks directly to the real source file
-                        std::os::unix::fs::symlink(entry.path(), &farm_entry)
-                            .with_context(|| format!("Failed to create symlink: {:?} -> {:?}", farm_entry, entry.path()))?;
+                        let source_path = entry.path();
+
+                        // Check if it's a regular file (not a symlink)
+                        if entry.file_type().is_file() {
+                            // Check if it's likely a shell script by reading first few bytes
+                            if let Ok(mut file) = std::fs::File::open(source_path) {
+                                let mut header = [0u8; 256];
+                                if let Ok(n) = file.read(&mut header) {
+                                    let header_str = String::from_utf8_lossy(&header[..n]);
+
+                                    // If it's a shell script with absolute paths, copy and rewrite
+                                    if header_str.starts_with("#!")
+                                        && (header_str.contains("/usr/")
+                                            || header_str.contains("/lib/")
+                                            || header_str.contains("/etc/"))
+                                    {
+                                        // Read full content
+                                        let content = std::fs::read_to_string(source_path)?;
+
+                                        // Rewrite absolute paths
+                                        let rewritten = content
+                                            .replace("/usr/lib/", "/tmp/arch-run/usr/lib/")
+                                            .replace("/usr/bin/", "/tmp/arch-run/usr/bin/")
+                                            .replace("/usr/share/", "/tmp/arch-run/usr/share/")
+                                            .replace("/lib/", "/tmp/arch-run/lib/")
+                                            .replace("/etc/", "/tmp/arch-run/etc/");
+
+                                        // Write to farm
+                                        std::fs::write(&farm_entry, rewritten)?;
+
+                                        // Make executable
+                                        use std::os::unix::fs::PermissionsExt;
+                                        let mut perms = std::fs::metadata(source_path)?.permissions();
+                                        perms.set_mode(perms.mode() | 0o111);
+                                        std::fs::set_permissions(&farm_entry, perms)?;
+
+                                        // Skip the symlink creation below
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Default: create symlink to source (existing behavior)
+                        std::os::unix::fs::symlink(source_path, &farm_entry)
+                            .with_context(|| format!("Failed to create symlink: {:?} -> {:?}", farm_entry, source_path))?;
 
                         // Bug 1 fix: Rewrite absolute symlink targets to resolve through the farm overlay
                         if farm_entry.is_symlink() {
