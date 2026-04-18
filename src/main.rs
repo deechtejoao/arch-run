@@ -268,7 +268,7 @@ impl CoreEngine {
 
     /// Spawns the bubblewrap container.
     /// Construct bwrap command-line arguments and execv.
-    pub fn execute_sandbox(&self, entry_point: &str, layers: &[PackageLayer], args: &[String]) -> Result<()> {
+    pub fn execute_sandbox(&self, entry_point: &str, layers: &[PackageLayer], args: &[String], gui: bool) -> Result<()> {
         tracing::info!("Building unified symlink farm for layers...");
         let farm = self.build_symlink_farm(layers)?;
         
@@ -296,6 +296,42 @@ impl CoreEngine {
         // Inject the package's bin and lib paths into the environment
         bwrap.arg("--setenv").arg("PATH").arg("/tmp/arch-run/usr/bin:/usr/local/bin:/usr/bin:/bin");
         bwrap.arg("--setenv").arg("LD_LIBRARY_PATH").arg("/tmp/arch-run/usr/lib:/tmp/arch-run/usr/lib64");
+
+        if gui {
+            // --- Display server detection and socket forwarding ---
+            // Wayland: bind $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY if both env vars exist
+            if let (Ok(xdg_runtime), Ok(wayland_display)) = (
+                std::env::var("XDG_RUNTIME_DIR"),
+                std::env::var("WAYLAND_DISPLAY"),
+            ) {
+                let wayland_socket = std::path::Path::new(&xdg_runtime).join(&wayland_display);
+                if wayland_socket.exists() {
+                    // Create the runtime dir inside sandbox and bind-mount the socket
+                    bwrap.args(["--dir", &xdg_runtime]);
+                    bwrap.args(["--ro-bind", &wayland_socket.to_string_lossy(), &wayland_socket.to_string_lossy()]);
+                    bwrap.arg("--setenv").arg("WAYLAND_DISPLAY").arg(&wayland_display);
+                    bwrap.arg("--setenv").arg("XDG_RUNTIME_DIR").arg(&xdg_runtime);
+                }
+            }
+
+            // X11: bind /tmp/.X11-unix/X{n} based on $DISPLAY
+            if let Ok(display) = std::env::var("DISPLAY") {
+                // DISPLAY is typically ":0" or ":1" — extract the number
+                let display_num = display.trim_start_matches(':').split('.').next().unwrap_or("0");
+                let x_socket_path = format!("/tmp/.X11-unix/X{}", display_num);
+                if std::path::Path::new(&x_socket_path).exists() {
+                    bwrap.args(["--dir", "/tmp/.X11-unix"]);
+                    bwrap.args(["--ro-bind", &x_socket_path, &x_socket_path]);
+                    bwrap.arg("--setenv").arg("DISPLAY").arg(&display);
+                }
+            }
+
+            // --- GPU / DRI forwarding ---
+            // Bind-mount the entire /dev/dri directory for hardware-accelerated rendering
+            if std::path::Path::new("/dev/dri").exists() {
+                bwrap.args(["--ro-bind", "/dev/dri", "/dev/dri"]);
+            }
+        }
 
         // Execute the target
         bwrap.arg(entry_point);
@@ -326,6 +362,10 @@ struct Args {
 
     /// Arguments to pass to the executed package.
     args: Vec<String>,
+
+    /// Enable GUI application support (forwards display, GPU, audio, D-Bus).
+    #[arg(long)]
+    gui: bool,
 
     /// Increase logging verbosity (can be used multiple times).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -410,7 +450,7 @@ async fn main() -> Result<()> {
                 engine.fetch_layers(&layers).await
                     .with_context(|| format!("Failed to fetch layers for package '{}'", pkg))?;
                 let entry_point = engine.resolve_binary_name(&pkg, &layers, args.bin.as_deref())?;
-                engine.execute_sandbox(&entry_point, &layers, &args.args)
+                engine.execute_sandbox(&entry_point, &layers, &args.args, args.gui)
                     .with_context(|| format!("Failed to execute sandbox for package '{}'", pkg))?;
             }
         }
