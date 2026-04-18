@@ -331,6 +331,63 @@ impl CoreEngine {
             if std::path::Path::new("/dev/dri").exists() {
                 bwrap.args(["--ro-bind", "/dev/dri", "/dev/dri"]);
             }
+
+            // --- D-Bus session bus forwarding ---
+            if let Ok(dbus_addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+                // DBUS_SESSION_BUS_ADDRESS is typically "unix:path=/run/user/1000/bus"
+                if let Some(path) = dbus_addr.strip_prefix("unix:path=") {
+                    if std::path::Path::new(path).exists() {
+                        // Ensure parent dir exists in sandbox
+                        if let Some(parent) = std::path::Path::new(path).parent() {
+                            bwrap.args(["--dir", &parent.to_string_lossy()]);
+                        }
+                        bwrap.args(["--ro-bind", path, path]);
+                    }
+                }
+                bwrap.arg("--setenv").arg("DBUS_SESSION_BUS_ADDRESS").arg(&dbus_addr);
+            }
+
+            // --- PulseAudio / PipeWire audio forwarding ---
+            if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+                let runtime_dir = std::path::Path::new(&xdg_runtime);
+
+                // Set XDG_RUNTIME_DIR if not already set by Wayland block above
+                bwrap.arg("--setenv").arg("XDG_RUNTIME_DIR").arg(&xdg_runtime);
+
+                // PulseAudio socket
+                let pulse_socket = runtime_dir.join("pulse/native");
+                if pulse_socket.exists() {
+                    // Ensure runtime dir exists (may already be created for Wayland)
+                    bwrap.args(["--dir", &xdg_runtime]);
+                    let pulse_dir = runtime_dir.join("pulse");
+                    bwrap.args(["--dir", &pulse_dir.to_string_lossy()]);
+                    bwrap.args(["--ro-bind", &pulse_socket.to_string_lossy(), &pulse_socket.to_string_lossy()]);
+                    bwrap.arg("--setenv").arg("PULSE_SERVER").arg(format!("unix:{}", pulse_socket.to_string_lossy()));
+                }
+
+                // PipeWire socket
+                let pipewire_socket = runtime_dir.join("pipewire-0");
+                if pipewire_socket.exists() {
+                    bwrap.args(["--dir", &xdg_runtime]);
+                    let pipewire_dir = runtime_dir.join("pipewire");
+                    bwrap.args(["--dir", &pipewire_dir.to_string_lossy()]);
+                    bwrap.args(["--ro-bind", &pipewire_socket.to_string_lossy(), &pipewire_socket.to_string_lossy()]);
+                }
+            }
+
+            // --- Font configuration ---
+            // Mount /etc/fonts for fontconfig to work inside the sandbox
+            if std::path::Path::new("/etc/fonts").exists() {
+                bwrap.args(["--ro-bind", "/etc/fonts", "/etc/fonts"]);
+            }
+
+            // --- Locale forwarding ---
+            // Forward locale-related env vars so GUI apps render text correctly
+            for var in &["LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_NUMERIC"] {
+                if let Ok(val) = std::env::var(var) {
+                    bwrap.arg("--setenv").arg(var).arg(&val);
+                }
+            }
         }
 
         // Execute the target
