@@ -135,35 +135,56 @@ impl CoreEngine {
 
     /// Builds a unified symlink farm (merged view) of all package layers.
     /// This prevents overlapping bind mount issues in bubblewrap and optimizes lookup performance.
+    ///
+    /// Bugs fixed:
+    /// - Bug 6: Maps ALL package directories (etc, lib, usr, var, opt), not just usr/
+    /// - Bug 1: Rewrites absolute symlink targets to resolve through the farm overlay at /tmp/arch-run/
     fn build_symlink_farm(&self, layers: &[PackageLayer]) -> Result<tempfile::TempDir> {
         let farm_dir = tempfile::tempdir_in(&self.cache_root)?;
-        
+
         for layer in layers {
-            let usr_path = layer.path.join("usr");
-            if !usr_path.exists() {
-                continue;
-            }
-            
-            for entry in walkdir::WalkDir::new(&usr_path) {
+            for entry in walkdir::WalkDir::new(&layer.path) {
                 let entry = entry?;
-                if let Ok(rel_path) = entry.path().strip_prefix(&usr_path) {
+                if let Ok(rel_path) = entry.path().strip_prefix(&layer.path) {
                     if rel_path.as_os_str().is_empty() {
                         continue;
                     }
-                    
-                    let target_path = farm_dir.path().join("usr").join(rel_path);
-                    
+
+                    let farm_entry = farm_dir.path().join(rel_path);
+
                     if entry.file_type().is_dir() {
-                        std::fs::create_dir_all(&target_path)
-                            .with_context(|| format!("Failed to create directory in symlink farm: {:?}", target_path))?;
-                    } else if !target_path.exists() {
-                        std::os::unix::fs::symlink(entry.path(), &target_path)
-                            .with_context(|| format!("Failed to create symlink: {:?} -> {:?}", target_path, entry.path()))?;
+                        std::fs::create_dir_all(&farm_entry)
+                            .with_context(|| format!("Failed to create directory in symlink farm: {:?}", farm_entry))?;
+                    } else if !farm_entry.exists() {
+                        // Point symlinks directly to the real source file
+                        std::os::unix::fs::symlink(entry.path(), &farm_entry)
+                            .with_context(|| format!("Failed to create symlink: {:?} -> {:?}", farm_entry, entry.path()))?;
+
+                        // Bug 1 fix: Rewrite absolute symlink targets to resolve through the farm overlay
+                        if farm_entry.is_symlink() {
+                            if let Ok(target) = std::fs::read_link(&farm_entry) {
+                                if target.is_absolute()
+                                    && (target.starts_with("/usr/")
+                                        || target.starts_with("/etc/")
+                                        || target.starts_with("/lib/")
+                                        || target.starts_with("/lib64/")
+                                        || target.starts_with("/var/")
+                                        || target.starts_with("/opt/")
+                                        || target.starts_with("/sbin/"))
+                                {
+                                    let rewritten = PathBuf::from(format!("/tmp/arch-run{}", target.display()));
+                                    // Remove the old symlink and create new one with rewritten target
+                                    std::fs::remove_file(&farm_entry)?;
+                                    std::os::unix::fs::symlink(&rewritten, &farm_entry)
+                                        .with_context(|| format!("Failed to rewrite symlink: {:?} -> {:?}", farm_entry, rewritten))?;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        
+
         Ok(farm_dir)
     }
 
