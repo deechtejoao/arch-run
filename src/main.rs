@@ -167,6 +167,105 @@ impl CoreEngine {
         Ok(farm_dir)
     }
 
+    /// Resolves the binary name to execute from a package.
+    ///
+    /// When a user provides `--bin`, validates it exists in a layer's `usr/bin/`.
+    /// Otherwise scans the primary package layer for binaries:
+    /// - If the package name matches a binary → use it (backward compat)
+    /// - If only one binary exists → use it
+    /// - If multiple binaries exist → error listing options
+    /// - If no binaries found → error
+    pub fn resolve_binary_name(
+        &self,
+        pkg_name: &str,
+        layers: &[PackageLayer],
+        explicit_bin: Option<&str>,
+    ) -> Result<String> {
+        // Collect all binaries across all layers (usr/bin/)
+        let mut all_binaries: Vec<String> = Vec::new();
+        let mut primary_binaries: Vec<String> = Vec::new();
+
+        for layer in layers {
+            let bin_dir = layer.path.join("usr").join("bin");
+            if !bin_dir.exists() {
+                continue;
+            }
+
+            let entries = std::fs::read_dir(&bin_dir)
+                .with_context(|| format!("Failed to read bin directory: {:?}", bin_dir))?;
+
+            for entry in entries {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if !file_type.is_file() && !file_type.is_symlink() {
+                    continue;
+                }
+
+                let name = entry.file_name().to_string_lossy().to_string();
+                all_binaries.push(name.clone());
+
+                if layer.name == pkg_name {
+                    primary_binaries.push(name);
+                }
+            }
+        }
+
+        // Explicit --bin override
+        if let Some(bin) = explicit_bin {
+            if all_binaries.iter().any(|b| b == bin) {
+                return Ok(bin.to_string());
+            }
+
+            let available = if all_binaries.is_empty() {
+                "No binaries found in any layer".to_string()
+            } else {
+                format!("Available binaries: {}", all_binaries.join(", "))
+            };
+
+            return Err(anyhow::anyhow!(
+                "Binary '{}' not found in package '{}'. {}",
+                bin, pkg_name, available
+            ));
+        }
+
+        // Backward compat: package name matches a binary
+        if primary_binaries.iter().any(|b| b == pkg_name) {
+            return Ok(pkg_name.to_string());
+        }
+
+        // Single binary → use it
+        if primary_binaries.len() == 1 {
+            return Ok(primary_binaries[0].clone());
+        }
+
+        // Multiple binaries → ambiguous
+        if primary_binaries.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "Multiple binaries found for package '{}': {}. Use --bin to select one.",
+                pkg_name,
+                primary_binaries.join(", ")
+            ));
+        }
+
+        // No binaries in primary layer — fall back to all layers
+        if all_binaries.len() == 1 {
+            return Ok(all_binaries[0].clone());
+        }
+
+        if all_binaries.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No binaries found for package '{}'. The package may not provide executables.",
+                pkg_name
+            ));
+        }
+
+        Err(anyhow::anyhow!(
+            "No binaries found in primary package '{}'. Available in dependencies: {}. Use --bin to specify.",
+            pkg_name,
+            all_binaries.join(", ")
+        ))
+    }
+
     /// Spawns the bubblewrap container.
     /// Construct bwrap command-line arguments and execv.
     pub fn execute_sandbox(&self, entry_point: &str, layers: &[PackageLayer], args: &[String]) -> Result<()> {
@@ -220,6 +319,10 @@ struct Args {
 
     /// The name of the package to execute.
     package: Option<String>,
+
+    /// Override the binary to execute within the package.
+    #[arg(short, long)]
+    bin: Option<String>,
 
     /// Arguments to pass to the executed package.
     #[arg(last = true)]
@@ -307,7 +410,8 @@ async fn main() -> Result<()> {
                     .with_context(|| format!("Failed to resolve dependencies for package '{}'", pkg))?;
                 engine.fetch_layers(&layers).await
                     .with_context(|| format!("Failed to fetch layers for package '{}'", pkg))?;
-                engine.execute_sandbox(&pkg, &layers, &args.args)
+                let entry_point = engine.resolve_binary_name(&pkg, &layers, args.bin.as_deref())?;
+                engine.execute_sandbox(&entry_point, &layers, &args.args)
                     .with_context(|| format!("Failed to execute sandbox for package '{}'", pkg))?;
             }
         }
