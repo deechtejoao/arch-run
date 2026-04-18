@@ -484,8 +484,44 @@ impl CoreEngine {
             }
         }
 
-        // Execute the target
-        bwrap.arg(entry_point);
+        // Construct absolute path to entry point within symlink farm
+        let full_entry_point = format!("/tmp/arch-run/usr/bin/{}", entry_point);
+        
+        // Validate entry point exists before executing
+        if !std::path::Path::new(&full_entry_point).exists() {
+            // Collect available binaries for helpful error message
+            let mut available_binaries = Vec::new();
+            for layer in layers {
+                let bin_dir = layer.path.join("usr").join("bin");
+                if bin_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+                        for entry in entries.flatten() {
+                            if entry.file_type().map(|ft| ft.is_file() || ft.is_symlink()).unwrap_or(false) {
+                                if let Some(name) = entry.file_name().to_str() {
+                                    available_binaries.push(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            available_binaries.sort();
+            available_binaries.dedup();
+            
+            let available_msg = if available_binaries.is_empty() {
+                "No binaries found in any layer".to_string()
+            } else {
+                format!("Available binaries: {}", available_binaries.join(", "))
+            };
+            
+            return Err(anyhow::anyhow!(
+                "Entry point '{}' not found in symlink farm at '{}'. {}",
+                entry_point, full_entry_point, available_msg
+            ));
+        }
+        
+        // Execute the target using absolute path
+        bwrap.arg(&full_entry_point);
         bwrap.args(args);
 
         let status = bwrap.status().with_context(|| format!("Failed to execute bwrap for entry point '{}'", entry_point))?;
