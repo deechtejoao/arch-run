@@ -484,11 +484,12 @@ impl CoreEngine {
             }
         }
 
-        // Construct absolute path to entry point within symlink farm
+        // Construct absolute path to entry point within symlink farm (path inside sandbox)
         let full_entry_point = format!("/tmp/arch-run/usr/bin/{}", entry_point);
         
-        // Validate entry point exists before executing
-        if !std::path::Path::new(&full_entry_point).exists() {
+        // Validate entry point exists in the farm before executing
+        let farm_entry_point = farm.path().join("usr").join("bin").join(entry_point);
+        if !farm_entry_point.exists() {
             // Collect available binaries for helpful error message
             let mut available_binaries = Vec::new();
             for layer in layers {
@@ -515,12 +516,12 @@ impl CoreEngine {
             };
             
             return Err(anyhow::anyhow!(
-                "Entry point '{}' not found in symlink farm at '{}'. {}",
-                entry_point, full_entry_point, available_msg
+                "Entry point '{}' not found in symlink farm. {}",
+                entry_point, available_msg
             ));
         }
         
-        // Execute the target using absolute path
+        // Execute the target using absolute path (inside sandbox)
         bwrap.arg(&full_entry_point);
         bwrap.args(args);
 
