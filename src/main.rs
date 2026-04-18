@@ -335,10 +335,12 @@ impl CoreEngine {
             // --- XDG_RUNTIME_DIR: bind once, covers Wayland, PulseAudio, PipeWire, D-Bus session ---
             // All runtime sockets live under XDG_RUNTIME_DIR. Binding it read-only makes every
             // socket accessible without mkdir (which fails on the read-only root bind).
+            // Then overlay a tmpfs to make it writable for apps that create subdirs (pipewire/, pulse/, etc.)
             let xdg_runtime_bound = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
                 let runtime_dir = std::path::Path::new(&xdg_runtime);
                 if runtime_dir.exists() {
                     bwrap.args(["--ro-bind", &xdg_runtime, &xdg_runtime]);
+                    bwrap.args(["--tmpfs", &xdg_runtime]);
                     bwrap.arg("--setenv").arg("XDG_RUNTIME_DIR").arg(&xdg_runtime);
                     true
                 } else {
