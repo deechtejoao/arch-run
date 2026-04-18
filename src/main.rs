@@ -298,25 +298,31 @@ impl CoreEngine {
         bwrap.arg("--setenv").arg("LD_LIBRARY_PATH").arg("/tmp/arch-run/usr/lib:/tmp/arch-run/usr/lib64");
 
         if gui {
-            // --- Display server detection and socket forwarding ---
-            // Wayland: bind $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY if both env vars exist
-            if let (Ok(xdg_runtime), Ok(wayland_display)) = (
-                std::env::var("XDG_RUNTIME_DIR"),
-                std::env::var("WAYLAND_DISPLAY"),
-            ) {
-                let wayland_socket = std::path::Path::new(&xdg_runtime).join(&wayland_display);
-                if wayland_socket.exists() {
-                    // Create the runtime dir inside sandbox and bind-mount the socket
-                    bwrap.args(["--dir", &xdg_runtime]);
-                    bwrap.args(["--ro-bind", &wayland_socket.to_string_lossy(), &wayland_socket.to_string_lossy()]);
-                    bwrap.arg("--setenv").arg("WAYLAND_DISPLAY").arg(&wayland_display);
+            // --- XDG_RUNTIME_DIR: bind once, covers Wayland, PulseAudio, PipeWire, D-Bus session ---
+            // All runtime sockets live under XDG_RUNTIME_DIR. Binding it read-only makes every
+            // socket accessible without mkdir (which fails on the read-only root bind).
+            let xdg_runtime_bound = if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+                let runtime_dir = std::path::Path::new(&xdg_runtime);
+                if runtime_dir.exists() {
+                    bwrap.args(["--ro-bind", &xdg_runtime, &xdg_runtime]);
                     bwrap.arg("--setenv").arg("XDG_RUNTIME_DIR").arg(&xdg_runtime);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+
+            // --- Wayland display socket ---
+            // Socket is accessible via XDG_RUNTIME_DIR bind; just set the env var.
+            if let Ok(wayland_display) = std::env::var("WAYLAND_DISPLAY") {
+                bwrap.arg("--setenv").arg("WAYLAND_DISPLAY").arg(&wayland_display);
             }
 
-            // X11: bind /tmp/.X11-unix/X{n} based on $DISPLAY
+            // --- X11: bind /tmp/.X11-unix/X{n} based on $DISPLAY ---
+            // /tmp is a tmpfs, so --dir works here (unlike /run on read-only root).
             if let Ok(display) = std::env::var("DISPLAY") {
-                // DISPLAY is typically ":0" or ":1" — extract the number
                 let display_num = display.trim_start_matches(':').split('.').next().unwrap_or("0");
                 let x_socket_path = format!("/tmp/.X11-unix/X{}", display_num);
                 if std::path::Path::new(&x_socket_path).exists() {
@@ -327,62 +333,42 @@ impl CoreEngine {
             }
 
             // --- GPU / DRI forwarding ---
-            // Bind-mount the entire /dev/dri directory for hardware-accelerated rendering
             if std::path::Path::new("/dev/dri").exists() {
                 bwrap.args(["--ro-bind", "/dev/dri", "/dev/dri"]);
             }
 
             // --- D-Bus session bus forwarding ---
+            // Socket at /run/user/UID/bus is covered by XDG_RUNTIME_DIR bind.
+            // Handle the uncommon case where the socket is outside XDG_RUNTIME_DIR.
             if let Ok(dbus_addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-                // DBUS_SESSION_BUS_ADDRESS is typically "unix:path=/run/user/1000/bus"
                 if let Some(path) = dbus_addr.strip_prefix("unix:path=") {
-                    if std::path::Path::new(path).exists() {
-                        // Ensure parent dir exists in sandbox
-                        if let Some(parent) = std::path::Path::new(path).parent() {
-                            bwrap.args(["--dir", &parent.to_string_lossy()]);
-                        }
+                    let dbus_path = std::path::Path::new(path);
+                    let under_xdg = xdg_runtime_bound
+                        && std::env::var("XDG_RUNTIME_DIR")
+                            .map(|xdg| dbus_path.starts_with(&xdg))
+                            .unwrap_or(false);
+                    if !under_xdg && dbus_path.exists() {
                         bwrap.args(["--ro-bind", path, path]);
                     }
                 }
                 bwrap.arg("--setenv").arg("DBUS_SESSION_BUS_ADDRESS").arg(&dbus_addr);
             }
 
-            // --- PulseAudio / PipeWire audio forwarding ---
+            // --- PulseAudio socket ---
+            // Accessible via XDG_RUNTIME_DIR bind; just set the env var.
             if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
-                let runtime_dir = std::path::Path::new(&xdg_runtime);
-
-                // Set XDG_RUNTIME_DIR if not already set by Wayland block above
-                bwrap.arg("--setenv").arg("XDG_RUNTIME_DIR").arg(&xdg_runtime);
-
-                // PulseAudio socket
-                let pulse_socket = runtime_dir.join("pulse/native");
+                let pulse_socket = std::path::Path::new(&xdg_runtime).join("pulse/native");
                 if pulse_socket.exists() {
-                    // Ensure runtime dir exists (may already be created for Wayland)
-                    bwrap.args(["--dir", &xdg_runtime]);
-                    let pulse_dir = runtime_dir.join("pulse");
-                    bwrap.args(["--dir", &pulse_dir.to_string_lossy()]);
-                    bwrap.args(["--ro-bind", &pulse_socket.to_string_lossy(), &pulse_socket.to_string_lossy()]);
                     bwrap.arg("--setenv").arg("PULSE_SERVER").arg(format!("unix:{}", pulse_socket.to_string_lossy()));
-                }
-
-                // PipeWire socket
-                let pipewire_socket = runtime_dir.join("pipewire-0");
-                if pipewire_socket.exists() {
-                    bwrap.args(["--dir", &xdg_runtime]);
-                    let pipewire_dir = runtime_dir.join("pipewire");
-                    bwrap.args(["--dir", &pipewire_dir.to_string_lossy()]);
-                    bwrap.args(["--ro-bind", &pipewire_socket.to_string_lossy(), &pipewire_socket.to_string_lossy()]);
                 }
             }
 
             // --- Font configuration ---
-            // Mount /etc/fonts for fontconfig to work inside the sandbox
             if std::path::Path::new("/etc/fonts").exists() {
                 bwrap.args(["--ro-bind", "/etc/fonts", "/etc/fonts"]);
             }
 
             // --- Locale forwarding ---
-            // Forward locale-related env vars so GUI apps render text correctly
             for var in &["LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_NUMERIC"] {
                 if let Ok(val) = std::env::var(var) {
                     bwrap.arg("--setenv").arg(var).arg(&val);
