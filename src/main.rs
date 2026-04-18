@@ -182,10 +182,28 @@ impl CoreEngine {
                                         // Read full content
                                         let content = std::fs::read_to_string(source_path)?;
 
-                                        // Rewrite absolute paths
+                                        // Rewrite absolute paths (but preserve shebang to avoid breaking /usr/bin/env interpreters)
                                         // Use a single pass to avoid double-replacement issues
                                         // Match paths that start with / and replace with /tmp/arch-run prefix
-                                        let rewritten = content
+                                        let mut rewritten = content;
+                                        
+                                        // Split into lines to handle shebang specially
+                                        let mut lines = rewritten.lines();
+                                        let shebang = if let Some(first_line) = lines.next() {
+                                            if first_line.starts_with("#!") {
+                                                // Keep shebang as-is to preserve /usr/bin/env paths
+                                                format!("{}\n", first_line)
+                                            } else {
+                                                String::new()
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        
+                                        let rest = lines.collect::<Vec<_>>().join("\n");
+                                        
+                                        // Rewrite paths in the rest of the script (not the shebang)
+                                        let rewritten_rest = rest
                                             .replace("/usr/lib/", "/tmp/arch-run/usr/lib/")
                                             .replace("/usr/bin/", "/tmp/arch-run/usr/bin/")
                                             .replace("/usr/share/", "/tmp/arch-run/usr/share/")
@@ -199,6 +217,8 @@ impl CoreEngine {
                                             // We use a simple heuristic: only replace if NOT preceded by "arch-run"
                                             .replace("/lib/", "/tmp/arch-run/lib/")
                                             .replace("/etc/", "/tmp/arch-run/etc/");
+                                        
+                                        rewritten = format!("{}{}", shebang, rewritten_rest);
                                         
                                         // Fix any double-replacements that may have occurred
                                         let rewritten = rewritten.replace("/tmp/arch-run/usr/tmp/arch-run/", "/tmp/arch-run/usr/");
@@ -363,13 +383,43 @@ impl CoreEngine {
         // Mount the host filesystem read-only to provide glibc and other system libraries
         bwrap.args(["--ro-bind", "/", "/"]);
 
-        // Basic mounts for a functional rootfs (must be after / to overlay it)
-        bwrap.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/dev/shm"]);
-
-        // Bind the merged symlink farm into the sandbox at /tmp/arch-run
+        // Create /tmp as tmpfs (makes /tmp writable for bind mounts)
+        bwrap.args(["--tmpfs", "/tmp"]);
+        
+        // Bind-mount farm directories to /tmp to make them accessible
+        // This MUST come after --tmpfs /tmp because the tmpfs makes /tmp writable
         let farm_path = farm.path().to_string_lossy().to_string();
+        let tmp_bin = format!("/tmp/arch-run/usr/bin");
+        let tmp_share = format!("/tmp/arch-run/usr/share");
+        let tmp_lib = format!("/tmp/arch-run/usr/lib");
+        let tmp_lib64 = format!("/tmp/arch-run/usr/lib64");
+        
+        // Create parent directories first (--dir doesn't create parents automatically)
         bwrap.args(["--dir", "/tmp/arch-run"]);
-        bwrap.args(["--ro-bind", &farm_path, "/tmp/arch-run"]);
+        bwrap.args(["--dir", "/tmp/arch-run/usr"]);
+        
+        bwrap.args(["--dir", &tmp_bin]);
+        bwrap.args(["--bind", &format!("{}/usr/bin", farm_path), &tmp_bin]);
+        
+        // Also bind share and lib directories for data files and libraries
+        if farm.path().join("usr").join("share").exists() {
+            bwrap.args(["--dir", "/tmp/arch-run/usr/share"]);
+            bwrap.args(["--bind", &format!("{}/usr/share", farm_path), &tmp_share]);
+        }
+        if farm.path().join("usr").join("lib").exists() {
+            bwrap.args(["--dir", "/tmp/arch-run/usr/lib"]);
+            bwrap.args(["--bind", &format!("{}/usr/lib", farm_path), &tmp_lib]);
+        }
+        if farm.path().join("usr").join("lib64").exists() {
+            bwrap.args(["--dir", "/tmp/arch-run/usr/lib64"]);
+            bwrap.args(["--bind", &format!("{}/usr/lib64", farm_path), &tmp_lib64]);
+        }
+
+        // Bind-mount /usr to provide access to system interpreters (perl, python, bash, env, etc.)
+        bwrap.args(["--bind", "/usr", "/usr"]);
+
+        // Other basic mounts
+        bwrap.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/dev/shm"]);
 
         // Allow read-write access to current working directory
         if let Ok(cwd) = std::env::current_dir() {
@@ -378,10 +428,11 @@ impl CoreEngine {
         }
 
         // Inject the package's bin and lib paths into the environment
-        bwrap.arg("--setenv").arg("PATH").arg("/tmp/arch-run/usr/bin:/usr/local/bin:/usr/bin:/bin");
+        // /tmp/arch-run/usr/bin comes first to prioritize farm binaries
+        bwrap.arg("--setenv").arg("PATH").arg("/tmp/arch-run/usr/bin:/usr/bin:/bin");
         // Bug 5 fix: Include host library paths as fallback for libraries not in any package layer,
-        // plus /tmp/arch-run/lib and /tmp/arch-run/lib64 for packages that put libs in /lib/
-        bwrap.arg("--setenv").arg("LD_LIBRARY_PATH").arg("/tmp/arch-run/usr/lib:/tmp/arch-run/usr/lib64:/tmp/arch-run/lib:/tmp/arch-run/lib64:/usr/lib:/usr/lib64:/lib:/lib64");
+        // plus /tmp/arch-run/lib and /tmp/arch-run/lib64 for farm libraries
+        bwrap.arg("--setenv").arg("LD_LIBRARY_PATH").arg("/tmp/arch-run/usr/lib:/tmp/arch-run/usr/lib64:/usr/lib:/usr/lib64:/lib:/lib64");
 
         // Bug 2 fix: Forward HOME into the sandbox so apps can find their profile directories
         if let Ok(home) = std::env::var("HOME") {
@@ -484,12 +535,13 @@ impl CoreEngine {
             }
         }
 
-        // Construct absolute path to entry point within symlink farm (path inside sandbox)
+        // Entry point is in /tmp/arch-run/usr/bin (bound from farm's usr/bin)
         let full_entry_point = format!("/tmp/arch-run/usr/bin/{}", entry_point);
         
         // Validate entry point exists in the farm before executing
         let farm_entry_point = farm.path().join("usr").join("bin").join(entry_point);
         if !farm_entry_point.exists() {
+            tracing::debug!("Entry point not found in farm: {:?}", farm_entry_point);
             // Collect available binaries for helpful error message
             let mut available_binaries = Vec::new();
             for layer in layers {
