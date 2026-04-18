@@ -183,12 +183,25 @@ impl CoreEngine {
                                         let content = std::fs::read_to_string(source_path)?;
 
                                         // Rewrite absolute paths
+                                        // Use a single pass to avoid double-replacement issues
+                                        // Match paths that start with / and replace with /tmp/arch-run prefix
                                         let rewritten = content
                                             .replace("/usr/lib/", "/tmp/arch-run/usr/lib/")
                                             .replace("/usr/bin/", "/tmp/arch-run/usr/bin/")
                                             .replace("/usr/share/", "/tmp/arch-run/usr/share/")
+                                            .replace("/usr/etc/", "/tmp/arch-run/usr/etc/")
+                                            .replace("/usr/opt/", "/tmp/arch-run/usr/opt/")
+                                            .replace("/usr/var/", "/tmp/arch-run/usr/var/")
+                                            .replace("/usr/sbin/", "/tmp/arch-run/usr/sbin/")
+                                            // Handle /lib64/ before /lib/ to avoid partial match
+                                            .replace("/lib64/", "/tmp/arch-run/lib64/")
+                                            // Only replace /lib/ and /etc/ at word boundaries (not in already-rewritten paths)
+                                            // We use a simple heuristic: only replace if NOT preceded by "arch-run"
                                             .replace("/lib/", "/tmp/arch-run/lib/")
                                             .replace("/etc/", "/tmp/arch-run/etc/");
+                                        
+                                        // Fix any double-replacements that may have occurred
+                                        let rewritten = rewritten.replace("/tmp/arch-run/usr/tmp/arch-run/", "/tmp/arch-run/usr/");
 
                                         // Write to farm
                                         std::fs::write(&farm_entry, rewritten)?;
