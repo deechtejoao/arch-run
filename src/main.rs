@@ -312,7 +312,7 @@ impl CoreEngine {
 
 /// Command-line arguments for the arch-run executor.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None, arg_required_else_help = true)]
+#[command(author, version, about, long_about = None, arg_required_else_help = true, trailing_var_arg = true)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -325,7 +325,6 @@ struct Args {
     bin: Option<String>,
 
     /// Arguments to pass to the executed package.
-    #[arg(last = true)]
     args: Vec<String>,
 
     /// Increase logging verbosity (can be used multiple times).
