@@ -20,6 +20,12 @@ impl CoreEngine {
         std::fs::create_dir_all(&cache_root)
             .with_context(|| format!("Failed to ensure cache directory exists at {:?}", cache_root))?;
 
+        // Bug 4 fix: Validate bwrap is available at startup
+        std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .with_context(|| "bubblewrap (bwrap) is not installed or not in PATH. Install it with: sudo pacman -S bubblewrap")?;
+
         Ok(Self { cache_root })
     }
 
@@ -316,7 +322,14 @@ impl CoreEngine {
 
         // Inject the package's bin and lib paths into the environment
         bwrap.arg("--setenv").arg("PATH").arg("/tmp/arch-run/usr/bin:/usr/local/bin:/usr/bin:/bin");
-        bwrap.arg("--setenv").arg("LD_LIBRARY_PATH").arg("/tmp/arch-run/usr/lib:/tmp/arch-run/usr/lib64");
+        // Bug 5 fix: Include host library paths as fallback for libraries not in any package layer,
+        // plus /tmp/arch-run/lib and /tmp/arch-run/lib64 for packages that put libs in /lib/
+        bwrap.arg("--setenv").arg("LD_LIBRARY_PATH").arg("/tmp/arch-run/usr/lib:/tmp/arch-run/usr/lib64:/tmp/arch-run/lib:/tmp/arch-run/lib64:/usr/lib:/usr/lib64:/lib:/lib64");
+
+        // Bug 2 fix: Forward HOME into the sandbox so apps can find their profile directories
+        if let Ok(home) = std::env::var("HOME") {
+            bwrap.arg("--setenv").arg("HOME").arg(&home);
+        }
 
         if gui {
             // --- XDG_RUNTIME_DIR: bind once, covers Wayland, PulseAudio, PipeWire, D-Bus session ---
@@ -334,6 +347,15 @@ impl CoreEngine {
             } else {
                 false
             };
+
+            // Bug 3 fix: Bind-mount the user's home directory read-write for application profiles.
+            // GUI apps like Firefox need to write to ~/.mozilla, ~/.cache, ~/.config, etc.
+            if let Ok(home) = std::env::var("HOME") {
+                let home_path = std::path::Path::new(&home);
+                if home_path.exists() {
+                    bwrap.args(["--bind", &home, &home]);
+                }
+            }
 
             // --- Wayland display socket ---
             // Socket is accessible via XDG_RUNTIME_DIR bind; just set the env var.
@@ -361,6 +383,10 @@ impl CoreEngine {
             // --- D-Bus session bus forwarding ---
             // Socket at /run/user/UID/bus is covered by XDG_RUNTIME_DIR bind.
             // Handle the uncommon case where the socket is outside XDG_RUNTIME_DIR.
+            // Bug 7 fix: Abstract D-Bus addresses (unix:abstract=) exist in a namespace,
+            // not on the filesystem, so they cannot be bind-mounted but ARE accessible
+            // inside the sandbox via the shared network namespace. Always forward the
+            // address env var regardless of socket type.
             if let Ok(dbus_addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
                 if let Some(path) = dbus_addr.strip_prefix("unix:path=") {
                     let dbus_path = std::path::Path::new(path);
@@ -372,6 +398,8 @@ impl CoreEngine {
                         bwrap.args(["--ro-bind", path, path]);
                     }
                 }
+                // Abstract addresses (unix:abstract=) and other formats:
+                // No bind-mount needed; env var is forwarded below regardless.
                 bwrap.arg("--setenv").arg("DBUS_SESSION_BUS_ADDRESS").arg(&dbus_addr);
             }
 
